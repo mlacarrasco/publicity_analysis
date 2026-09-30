@@ -1,0 +1,54 @@
+{
+  "originals_dir": "images_or",
+  "labels_csv": "etiquetas_originales.csv",
+  "csv_sep": null,
+  "image_col": null,
+  "label_col": "label",
+  "output_dir": "resultados",
+  "pretrained": true,
+  "img_size": {
+    "resnet152": 224,
+    "resnet50": 224,
+    "efficientnet_v2_m": 480
+  },
+  "keep_full_image": true,
+  "rotation_deg": 20.0,
+  "zoom": 0.2,
+  "shift": 0.1,
+  "horizontal_flip": true,
+  "vertical_flip": true,
+  "test_size": 0.15,
+  "val_size": 0.15,
+  "test_seed": 2024,
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "optuna_trials": 15,
+  "optuna_epochs": 10,
+  "lr_range": [
+    0.0001,
+    0.1
+  ],
+  "batch_sizes": [
+    16,
+    32,
+    64,
+    128,
+    256
+  ],
+  "optimizers": [
+    "Adam",
+    "RMSprop",
+    "SGD"
+  ],
+  "selection_metric": "macro_f1",
+  "final_epochs": 45,
+  "patience": 10,
+  "class_weighted_loss": true,
+  "num_workers": 0,
+  "device": "cpu"
+}
