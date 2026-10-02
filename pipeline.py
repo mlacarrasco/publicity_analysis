@@ -489,11 +489,18 @@ def run_optuna(exp, df: pd.DataFrame, cfg: Config, seed: int | None = None, verb
             torch.cuda.empty_cache()
         return best
 
-    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=seed),
-                                study_name=f'exp_{exp}')
-    study.optimize(objective, n_trials=cfg.optuna_trials)
     out = os.path.join(cfg.output_dir, 'optuna')
     os.makedirs(out, exist_ok=True)
+    # Estudio persistente en SQLite: si la sesión se corta, se retoma desde los trials completados.
+    storage = f'sqlite:///{os.path.abspath(os.path.join(out, "optuna.db"))}'
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=seed),
+                                study_name=f'exp_{exp}_seed{seed}', storage=storage,
+                                load_if_exists=True)
+    done = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
+    if done:
+        print(f'Experimento {exp}: {done}/{cfg.optuna_trials} trials ya completados')
+    if done < cfg.optuna_trials:
+        study.optimize(objective, n_trials=cfg.optuna_trials - done)
     study.trials_dataframe().to_csv(os.path.join(out, f'trials_exp{exp}.csv'), index=False)
     return study
 
@@ -506,6 +513,15 @@ def run_final(exp, params: dict, df: pd.DataFrame, cfg: Config, verbose=False) -
     mdir = os.path.join(cfg.output_dir, 'modelos')
     os.makedirs(mdir, exist_ok=True)
     for seed in cfg.seeds:
+        # Si esta combinación (exp, semilla, hiperparámetros) ya terminó, se reutiliza.
+        res_path = os.path.join(mdir, f'result_exp{exp}_seed{seed}.json')
+        if os.path.exists(res_path):
+            with open(res_path, encoding='utf-8') as f:
+                cached = json.load(f)
+            if cached['params'] == params:
+                print(f'Experimento {exp}, semilla {seed}: ya entrenado, se carga {res_path}')
+                results.append(cached['metrics'])
+                continue
         set_seed(seed)
         splits = make_splits(df, cfg, seed)
         save_manifest(splits, os.path.join(cfg.output_dir, 'manifiestos', f'split_seed{seed}.csv'))
@@ -534,6 +550,10 @@ def run_final(exp, params: dict, df: pd.DataFrame, cfg: Config, verbose=False) -
                     'state': model.trainable_state()},
                    os.path.join(mdir, f'exp{exp}_seed{seed}.pt'))
         hist.to_csv(os.path.join(mdir, f'history_exp{exp}_seed{seed}.csv'), index=False)
+        # Se escribe al final y de forma atómica: su existencia indica que la semilla terminó.
+        with open(res_path + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump({'params': params, 'metrics': m}, f, indent=2, default=float)
+        os.replace(res_path + '.tmp', res_path)
         del model
         if cfg.device == 'cuda':
             torch.cuda.empty_cache()
