@@ -97,6 +97,12 @@ class Config:
     patience: int = 10             # [FIX-11] early stopping + se restaura la mejor época
     class_weighted_loss: bool = True  # [FIX-16] manejo del desbalance de clases
 
+    # Linear probe sobre embeddings precalculados (sección 7b)
+    embedding_views: int = 4       # vistas aumentadas por imagen, solo para entrenar el probe
+    probe_Cs: tuple = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0)
+    cv_splits: int = 5
+    cv_repeats: int = 5
+
     num_workers: int = 0
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -674,6 +680,184 @@ def run_svm_baseline(df: pd.DataFrame, cfg: Config, Cs=(0.1, 1, 10, 100)) -> lis
         m = compute_metrics(y['test'], best[2].predict(X['test']))
         m.update({'exp': 'svm_handcrafted', 'arch': 'SVM', 'seed': seed, 'C': best[1]})
         results.append(m)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Linear probe sobre embeddings precalculados (sección 7b)
+# ---------------------------------------------------------------------------
+# Modelos fundacionales (Hugging Face) y, para comparar bajo el MISMO protocolo, los backbones
+# torchvision de la ablación (None = se carga con load_features).
+EMBEDDING_MODELS = {
+    'clip_vitl14': 'openai/clip-vit-large-patch14',
+    'siglip_so400m': 'google/siglip-so400m-patch14-384',
+    'dinov2_large': 'facebook/dinov2-large',
+    'resnet152': None,
+    'efficientnet_v2_m': None,
+}
+
+
+def _side(size) -> int | None:
+    if size is None:
+        return None
+    for k in ('height', 'shortest_edge'):
+        v = size.get(k) if isinstance(size, dict) else getattr(size, k, None)
+        if v:
+            return int(v)
+    return None
+
+
+def _load_embedder(key: str, cfg: Config):
+    """Devuelve (función batch→embeddings, lado de entrada, media, desviación) para `key`."""
+    if EMBEDDING_MODELS[key] is None:
+        features, _ = load_features(key, pretrained=True)
+        features = features.to(cfg.device).eval()
+        return (lambda x: features(x).mean((2, 3))), cfg.img_size[key], IMAGENET_MEAN, IMAGENET_STD
+
+    from transformers import AutoImageProcessor, AutoModel
+    name = EMBEDDING_MODELS[key]
+    proc = AutoImageProcessor.from_pretrained(name)
+    model = AutoModel.from_pretrained(name).to(cfg.device).eval()
+    size = _side(getattr(proc, 'crop_size', None)) or _side(proc.size)
+
+    def fn(x):
+        if hasattr(model, 'get_image_features'):  # CLIP / SigLIP: espacio imagen-texto
+            out = model.get_image_features(pixel_values=x)
+            return out if torch.is_tensor(out) else out.pooler_output
+        h = model(pixel_values=x).last_hidden_state  # DINOv2: CLS + media de parches
+        return torch.cat([h[:, 0], h[:, 1:].mean(1)], 1)
+
+    return fn, size, np.asarray(proc.image_mean), np.asarray(proc.image_std)
+
+
+def _embedding_transform(size, mean, std, cfg: Config, train: bool):
+    """Mismo redimensionado que las CNN [FIX-15]. Las vistas de entrenamiento usan una
+    augmentation suave: sin flip vertical ni rotaciones (texto y logos quedan legibles)."""
+    ops = [_resize_op(size, cfg)]
+    if train:
+        ops += [T.RandomResizedCrop(size, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+                T.RandomHorizontalFlip()]
+    ops += [T.ToTensor(), T.Normalize(list(mean), list(std))]
+    return T.Compose(ops)
+
+
+@torch.no_grad()
+def extract_embeddings(df: pd.DataFrame, key: str, cfg: Config, batch_size: int = 64) -> dict:
+    """Embeddings de las imágenes originales ('X', N×D) y de cfg.embedding_views vistas
+    aumentadas ('X_aug', V×N×D). El backbone está congelado, así que se calculan UNA vez y se
+    guardan en <output_dir>/embeddings/ (se reutilizan si la lista de imágenes coincide)."""
+    n_views = cfg.embedding_views
+    path = os.path.join(cfg.output_dir, 'embeddings', f'{key}_v{n_views}.npz')
+    if os.path.exists(path):
+        cached = np.load(path, allow_pickle=False)
+        if cached['image'].tolist() == df['image'].tolist():
+            print(f'{key}: embeddings cargados de {path}')
+            return {'X': cached['X'], 'X_aug': cached['X_aug']}
+
+    fn, size, mean, std = _load_embedder(key, cfg)
+    use_amp = cfg.device == 'cuda'
+
+    def run(train):
+        loader = DataLoader(ImageDataset(df, _embedding_transform(size, mean, std, cfg, train)),
+                            batch_size=batch_size, shuffle=False, num_workers=cfg.num_workers)
+        out = []
+        for x, _ in loader:
+            with torch.autocast('cuda', dtype=torch.float16, enabled=use_amp):
+                out.append(fn(x.to(cfg.device)).float().cpu())
+        return torch.cat(out).numpy()
+
+    set_seed(0)
+    X = run(train=False)
+    X_aug = np.stack([run(train=True) for _ in range(n_views)]) if n_views else \
+        np.empty((0, *X.shape), dtype=X.dtype)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savez(path, X=X, X_aug=X_aug, image=df['image'].to_numpy(dtype=str))
+    print(f'{key}: {X.shape[0]} imágenes × {X.shape[1]} dims, {n_views} vistas aumentadas → {path}')
+    if cfg.device == 'cuda':
+        torch.cuda.empty_cache()
+    return {'X': X, 'X_aug': X_aug}
+
+
+def _probe(C: float, seed: int):
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    return make_pipeline(StandardScaler(),
+                         LogisticRegression(C=C, class_weight='balanced', max_iter=5000,
+                                            random_state=seed))
+
+
+def _fit_probe(emb: dict, idx: np.ndarray, y_all: np.ndarray, C: float, seed: int):
+    """Entrena con las imágenes `idx` y sus vistas aumentadas (nunca las de otras particiones)."""
+    X, y = emb['X'][idx], y_all[idx]
+    if len(emb['X_aug']):
+        X = np.concatenate([X, emb['X_aug'][:, idx].reshape(-1, X.shape[1])])
+        y = np.tile(y, 1 + len(emb['X_aug']))
+    return _probe(C, seed).fit(X, y)
+
+
+def _select_C_cv(X, y, cfg: Config, seed: int) -> float:
+    """Elige C por CV interna (5 pliegues, solo originales) con la métrica de selección
+    calculada sobre las predicciones fuera de pliegue: más estable que un val con 12 negativas."""
+    from sklearn.model_selection import StratifiedKFold, cross_val_predict
+    skf = StratifiedKFold(5, shuffle=True, random_state=seed)
+    scores = [compute_metrics(y, cross_val_predict(_probe(C, seed), X, y, cv=skf, n_jobs=-1))
+              [cfg.selection_metric] for C in cfg.probe_Cs]
+    return cfg.probe_Cs[int(np.argmax(scores))]
+
+
+def run_embedding_final(key: str, emb: dict, df: pd.DataFrame, cfg: Config) -> list:
+    """Protocolo de la Tabla III: mismas particiones y semillas que las CNN y el SVM.
+    Se entrena en train, se elige C en val y se evalúa UNA vez en el test fijo."""
+    pos = {img: i for i, img in enumerate(df['image'])}
+    y_all = df['label'].values
+    results = []
+    for seed in cfg.seeds:
+        s = make_splits(df, cfg, seed)
+        idx = {k: v['image'].map(pos).values for k, v in s.items()}
+        best = None
+        for C in cfg.probe_Cs:
+            clf = _fit_probe(emb, idx['train'], y_all, C, seed)
+            score = compute_metrics(y_all[idx['val']], clf.predict(emb['X'][idx['val']]))[
+                cfg.selection_metric]
+            if best is None or score > best[0]:
+                best = (score, C, clf)
+        m = compute_metrics(y_all[idx['test']], best[2].predict(emb['X'][idx['test']]))
+        m.update({'exp': f'lp_{key}', 'arch': f'{key}+LR', 'seed': seed, 'C': best[1]})
+        results.append(m)
+    return results
+
+
+def run_embedding_cv(key: str, emb: dict, df: pd.DataFrame, cfg: Config) -> list:
+    """Validación cruzada estratificada repetida (cfg.cv_repeats × cfg.cv_splits) sobre las
+    2.000 imágenes. En cada repetición todas las imágenes (incluidas las 77 Negative) se
+    predicen una vez fuera de pliegue; las métricas se calculan por repetición, así que
+    summarize() da media ± IC95% sobre repeticiones."""
+    from sklearn.model_selection import StratifiedKFold
+    path = os.path.join(cfg.output_dir, 'embeddings',
+                        f'cv_{key}_v{cfg.embedding_views}_{cfg.cv_repeats}x{cfg.cv_splits}.json')
+    if os.path.exists(path):
+        print(f'{key}: CV ya calculada, se carga {path}')
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    y_all = df['label'].values
+    results = []
+    for rep in range(cfg.cv_repeats):
+        seed = cfg.test_seed + rep
+        pred = np.full(len(y_all), -1)
+        Cs = []
+        skf = StratifiedKFold(cfg.cv_splits, shuffle=True, random_state=seed)
+        for tr, te in skf.split(emb['X'], y_all):
+            C = _select_C_cv(emb['X'][tr], y_all[tr], cfg, seed)
+            pred[te] = _fit_probe(emb, tr, y_all, C, seed).predict(emb['X'][te])
+            Cs.append(C)
+        m = compute_metrics(y_all, pred)
+        m.update({'exp': f'lp_{key}', 'arch': f'{key}+LR', 'seed': rep, 'C_per_fold': Cs})
+        results.append(m)
+        print(f'{key}, repetición {rep}: macro-F1={m["macro_f1"]:.3f}  acc={m["accuracy"]:.3f}')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=2, default=float)
     return results
 
 
