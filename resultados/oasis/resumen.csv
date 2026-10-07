@@ -1,0 +1,11 @@
+,valor
+Valencia: confiabilidad del promedio (split-half SB),0.9921335041632491
+Valencia: confiabilidad de 1 evaluador (ICC1),0.5387269998016468
+Arousal: confiabilidad del promedio (split-half SB),0.9632155474556805
+Arousal: confiabilidad de 1 evaluador (ICC1),0.19078206780867502
+Valencia 3 clases: α nominal,0.37587437132048673
+Valencia 3 clases: % medio de acuerdo con el consenso,0.7081990971428298
+Techo con 1 anotador: accuracy,0.7029185140544961
+Techo con 1 anotador: macro-F1,0.6756635208594118
+Techo con 1 anotador: κ de Cohen,0.5318697781165806
+Macro-F1 con 5 anotadores,0.7912891050991242

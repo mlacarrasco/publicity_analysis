@@ -1,0 +1,13 @@
+# Archivos de más de 100 MB (límite de GitHub)
+# OASIS_data_long.csv se sube comprimido como OASIS_data_long.zip
+oasis/Data files/OASIS_data_long.csv
+# Descarga original de OSF
+*osfstorage-archive.zip
+
+# Redundante: su contenido ya está en oasis/Stimulus set/OASIS/
+oasis/Stimulus set/OASIS.zip
+
+# Archivos del sistema y temporales
+__pycache__/
+.DS_Store
+~$*

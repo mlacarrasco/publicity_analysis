@@ -1072,3 +1072,118 @@ def select_quickshift(images: list, predict_fn, kernel_sizes, max_dists, ratios,
     df = pd.DataFrame(rows)
     df['valid'] = df['mean_n_segments'].between(min_segments, max_segments)
     return df.sort_values(['valid', 'mean_jaccard_topk', 'mean_r2'], ascending=False)
+
+
+# ---------------------------------------------------------------------------
+# LIME vs. atención humana estimada (DeepGaze IIE)  — notebook 03
+# ---------------------------------------------------------------------------
+def save_explanation(res: dict, path: str):
+    """Guarda una explicación de explain() (incluye R² y probabilidades, para poder filtrar)."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    np.savez_compressed(path, segments=res['segments'],
+                        weight_ids=np.array(list(res['weights'].keys())),
+                        weight_values=np.array(list(res['weights'].values())),
+                        label=res['label'], prob=res['prob'], probs=res['probs'],
+                        score=res['score'])
+
+
+def load_explanation(path: str) -> dict:
+    d = np.load(path)
+    segments = d['segments']
+    return {'label': int(d['label']), 'prob': float(d['prob']), 'probs': d['probs'],
+            'segments': segments, 'score': float(d['score']),
+            'weights': dict(zip(d['weight_ids'].tolist(), d['weight_values'].tolist())),
+            'n_segments': int(segments.max() + 1)}
+
+
+DEEPGAZE_CENTERBIAS_URL = ('https://github.com/matthias-k/DeepGaze/releases/download/v1.0.0/'
+                           'centerbias_mit1003.npy')
+
+
+def load_deepgaze(cfg: Config, centerbias_path: str):
+    """DeepGaze IIE preentrenado (Linardos et al., ICCV 2021) y la plantilla de sesgo central
+    de MIT1003 (log-densidad 1024×1024)."""
+    import deepgaze_pytorch
+    if not os.path.exists(centerbias_path):
+        os.makedirs(os.path.dirname(centerbias_path) or '.', exist_ok=True)
+        torch.hub.download_url_to_file(DEEPGAZE_CENTERBIAS_URL, centerbias_path)
+    model = deepgaze_pytorch.DeepGazeIIE(pretrained=True).to(cfg.device).eval()
+    return model, np.load(centerbias_path)
+
+
+def _to_lime_geometry(density: np.ndarray, arch: str, cfg: Config) -> np.ndarray:
+    """Lleva un mapa definido sobre la imagen original a la geometría de load_image_01
+    (mismo redimensionado/recorte que ve LIME) y lo renormaliza a suma 1."""
+    img = Image.fromarray(density.astype(np.float32))  # modo 'F'
+    out = np.clip(np.asarray(_resize_op(cfg.img_size[arch], cfg)(img), dtype=np.float64), 0, None)
+    return out / out.sum()
+
+
+@torch.no_grad()
+def deepgaze_maps(path: str, model, centerbias_template: np.ndarray, arch: str, cfg: Config,
+                  max_side: int = 1024) -> dict:
+    """Tres mapas de densidad (suma 1) en la geometría de LIME:
+      - 'deepgaze': predicción completa (contenido + sesgo central de MIT1003);
+      - 'deepgaze_content': DeepGaze con sesgo central uniforme (solo contenido de la imagen);
+      - 'centerbias': solo el sesgo central (control: ¿basta con 'mirar al centro'?).
+    DeepGaze se aplica a la imagen ORIGINAL (con su relación de aspecto, lado mayor = max_side),
+    no a la versión cuadrada que ve el clasificador."""
+    from scipy.ndimage import zoom
+    from scipy.special import logsumexp
+    img = Image.open(path).convert('RGB')
+    s = max_side / max(img.size)
+    img = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))), Image.BILINEAR)
+    x = np.asarray(img)
+    h, w = x.shape[:2]
+    cb = zoom(centerbias_template, (h / centerbias_template.shape[0], w / centerbias_template.shape[1]),
+              order=0, mode='nearest')
+    cb -= logsumexp(cb)
+    flat = np.full((h, w), -np.log(h * w))
+    xt = torch.tensor(x.transpose(2, 0, 1)[None]).to(cfg.device)
+
+    def run(log_cb):
+        ld = model(xt, torch.tensor(log_cb[None]).to(cfg.device))
+        return np.exp(ld.squeeze().double().cpu().numpy())
+
+    return {'deepgaze': _to_lime_geometry(run(cb), arch, cfg),
+            'deepgaze_content': _to_lime_geometry(run(flat), arch, cfg),
+            'centerbias': _to_lime_geometry(np.exp(cb), arch, cfg)}
+
+
+def saliency_alignment(res: dict, sal: np.ndarray, k: int = 5) -> dict:
+    """Alineamiento entre una explicación LIME y un mapa de densidad de atención (suma 1).
+      - spearman_signed: pesos LIME (con signo) vs saliencia media de cada superpíxel;
+      - spearman_abs: |peso| vs saliencia (importancia sin dirección);
+      - mass_topk: fracción de la atención que cae en los top-k superpíxeles positivos;
+      - area_topk: fracción del área que ocupan esos superpíxeles;
+      - enrichment_topk = mass/area (>1: las regiones que usa el modelo atraen más atención
+        que una región promedio del mismo tamaño);
+      - jaccard_topk: top-k de LIME vs top-k superpíxeles por saliencia media."""
+    seg = res['segments']
+    ids = sorted(res['weights'])
+    w = np.array([res['weights'][i] for i in ids])
+    s_mean = segment_means(sal, seg)[ids]
+    sel = np.isin(seg, topk_segments(res['weights'], k))
+    mass, area = sal[sel].sum(), sel.mean()
+    return {'spearman_signed': stats.spearmanr(w, s_mean).correlation,
+            'spearman_abs': stats.spearmanr(np.abs(w), s_mean).correlation,
+            'mass_topk': mass, 'area_topk': area,
+            'enrichment_topk': mass / area if area > 0 else np.nan,
+            'jaccard_topk': jaccard_topk(res['weights'], dict(zip(ids, s_mean)), k)}
+
+
+def permutation_alignment(explanations: dict, sal_maps: dict, k: int = 5, n_perm: int = 50,
+                          seed: int = 0) -> pd.DataFrame:
+    """Baseline de permutación: la explicación de cada imagen contra el mapa DeepGaze de OTRAS
+    imágenes. Si el alineamiento no baja, lo medido es una regularidad de composición de los
+    anuncios (p. ej. el producto al centro), no una coincidencia propia de cada imagen."""
+    rng = np.random.default_rng(seed)
+    names = list(explanations)
+    rows = []
+    for i, name in enumerate(names):
+        others = rng.choice([j for j in range(len(names)) if j != i],
+                            size=min(n_perm, len(names) - 1), replace=False)
+        m = pd.DataFrame([saliency_alignment(explanations[name], sal_maps[names[j]], k)
+                          for j in others]).mean()
+        rows.append({'image': name, **m.to_dict()})
+    return pd.DataFrame(rows)
